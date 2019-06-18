@@ -86,6 +86,7 @@ const (
 	UTXOTotalKey              = "xtotal"
 	UTXOContractExecutionTime = 500
 	TxWaitTimeout             = 5
+	DefaultMaxConfirmedDelay  = 300
 )
 
 // UtxoVM UTXO VM
@@ -132,6 +133,7 @@ type UtxoVM struct {
 	contractExectionTime int
 	unconfirmTxInMem     *sync.Map //未确认Tx表的内存镜像
 	defaultTxVersion     int32     // 默认的tx version
+	maxConfirmedDelay    uint32    // 交易处于unconfirm状态的最长时间，超过后会被回滚
 }
 
 // InboundTx is tx wrapper
@@ -407,6 +409,7 @@ func MakeUtxoVM(bcname string, ledger *ledger_pkg.Ledger, storePath string, priv
 		model3:               model3,
 		vmMgr3:               vmManager,
 		aclMgr:               aclManager,
+		maxConfirmedDelay:    DefaultMaxConfirmedDelay,
 	}
 	if iBeta {
 		utxoVM.defaultTxVersion = BetaTxVersion
@@ -694,25 +697,66 @@ func (uv *UtxoVM) SelectUtxos(fromAddr string, fromPubKey string, totalNeed *big
 }
 
 // PreExec the Xuper3 contract model uses previous execution to generate RWSets
-func (uv *UtxoVM) PreExec(req *pb.InvokeRequest, hd *global.XContext) (*pb.InvokeResponse, error) {
-	moduleName := req.ModuleName
-	vm, err := uv.vmMgr3.GetVM(moduleName)
+func (uv *UtxoVM) PreExec(req *pb.InvokeRPCRequest, hd *global.XContext) (*pb.InvokeResponse, error) {
+	reservedRequests, err := uv.getReservedContractRequests(req, nil)
 	if err != nil {
+		uv.xlog.Error("PreExec getReservedContractRequests error", "error", err)
 		return nil, err
 	}
+
+	// contract request with reservedRequests
+	req.Requests = append(reservedRequests, req.Requests...)
+	uv.xlog.Error("PreExec requests after merge", "requests", req.Requests)
+	// init modelCache
 	modelCache, err := xmodel.NewXModelCache(uv.GetXModel(), true)
 	if err != nil {
 		return nil, err
 	}
-	ctx, err := vm.NewContext(req.GetContractName(), modelCache, contract.MaxGasLimit)
-	if err != nil {
-		return nil, err
+
+	contextConfig := &contract.ContextConfig{
+		XMCache:      modelCache,
+		Initiator:    req.GetInitiator(),
+		AuthRequire:  req.GetAuthRequire(),
+		ContractName: "",
+		GasLimit:     contract.MaxGasLimit,
 	}
-	response, err := ctx.Invoke(req.MethodName, req.Args)
-	defer ctx.Release()
-	if err != nil {
-		return nil, err
+	gasUesdTotal := int64(0)
+	response := [][]byte{}
+
+	for i := 0; i < len(req.Requests); i++ {
+		tmpReq := req.Requests[i]
+		moduleName := tmpReq.GetModuleName()
+		vm, err := uv.vmMgr3.GetVM(moduleName)
+		if err != nil {
+			return nil, err
+		}
+
+		contextConfig.ContractName = tmpReq.GetMethodName()
+		ctx, err := vm.NewContext(contextConfig)
+		if err != nil {
+			// FIXME zq @icexin need to return contract not found error
+			uv.xlog.Error("PreExec NewContext error", "error", err,
+				"contractName", tmpReq.GetContractName())
+			if i < len(reservedRequests) && err.Error() == "Key not found" {
+				continue
+			}
+			return nil, err
+		}
+		res, err := ctx.Invoke(tmpReq.GetMethodName(), tmpReq.GetArgs())
+		if err != nil {
+			ctx.Release()
+			uv.xlog.Error("PreExec Invoke error", "error", err,
+				"contractName", tmpReq.GetContractName())
+			return nil, err
+		}
+		response = append(response, res)
+
+		if i >= len(reservedRequests) {
+			gasUesdTotal += ctx.GasUsed()
+		}
+		ctx.Release()
 	}
+
 	inputs, outputs, err := modelCache.GetRWSets()
 	if err != nil {
 		return nil, err
@@ -721,7 +765,8 @@ func (uv *UtxoVM) PreExec(req *pb.InvokeRequest, hd *global.XContext) (*pb.Invok
 		Inputs:   xmodel.GetTxInputs(inputs),
 		Outputs:  xmodel.GetTxOutputs(outputs),
 		Response: response,
-		GasUsed:  ctx.GasUsed(),
+		Requests: req.Requests,
+		GasUsed:  gasUesdTotal,
 	}
 	return rsps, nil
 }
@@ -730,9 +775,10 @@ func (uv *UtxoVM) PreExec(req *pb.InvokeRequest, hd *global.XContext) (*pb.Invok
 // 参数:	dedup : true-删除已经确认tx, false-保留已经确认tx
 //  返回：txMap : txid -> Transaction
 //        txGraph:  txid ->  [依赖此txid的tx]
-func (uv *UtxoVM) sortUnconfirmedTx() (map[string]*pb.Transaction, TxGraph, error) {
+func (uv *UtxoVM) sortUnconfirmedTx() (map[string]*pb.Transaction, TxGraph, map[string]bool, error) {
 	// 构造反向依赖关系图, key是被依赖的交易
 	txMap := map[string]*pb.Transaction{}
+	delayedTxMap := map[string]bool{}
 	txGraph := TxGraph{}
 	uv.unconfirmTxInMem.Range(func(k, v interface{}) bool {
 		txMap[k.(string)] = v.(*pb.Transaction)
@@ -742,7 +788,11 @@ func (uv *UtxoVM) sortUnconfirmedTx() (map[string]*pb.Transaction, TxGraph, erro
 	var totalDelay int64
 	now := time.Now().UnixNano()
 	for txID, tx := range txMap {
-		totalDelay += (now - tx.Timestamp)
+		txDelay := (now - tx.ReceivedTimestamp)
+		totalDelay += txDelay
+		if uint32(txDelay/1e9) > uv.maxConfirmedDelay {
+			delayedTxMap[txID] = true
+		}
 		for _, refTx := range tx.TxInputs {
 			refTxID := string(refTx.RefTxid)
 			if _, exist := txMap[refTxID]; !exist {
@@ -763,7 +813,7 @@ func (uv *UtxoVM) sortUnconfirmedTx() (map[string]*pb.Transaction, TxGraph, erro
 		avgDelay := totalDelay / int64(len(txMap)) //平均unconfirm滞留时间
 		uv.xlog.Info("average unconfirm delay", "micro-senconds", avgDelay/1e6, "count", len(txMap))
 	}
-	return txMap, txGraph, nil
+	return txMap, txGraph, delayedTxMap, nil
 }
 
 //从disk还原unconfirm表到内存, 初始化的时候
@@ -792,7 +842,7 @@ func (uv *UtxoVM) GetUnconfirmedTx(dedup bool) ([]*pb.Transaction, error) {
 		dedup = false
 	}
 	var selectedTxs []*pb.Transaction
-	txMap, txGraph, loadErr := uv.sortUnconfirmedTx()
+	txMap, txGraph, _, loadErr := uv.sortUnconfirmedTx()
 	if loadErr != nil {
 		return nil, loadErr
 	}
@@ -1296,7 +1346,18 @@ func getGasLimitFromTx(tx *pb.Transaction) (int64, error) {
 
 // verifyTxRWSets verify tx read sets and write sets
 func (uv *UtxoVM) verifyTxRWSets(tx *pb.Transaction) (bool, error) {
-	req := tx.GetContractRequest()
+	req := tx.GetContractRequests()
+	reservedRequests, err := uv.getReservedContractRequests(nil, tx)
+	if err != nil {
+		uv.xlog.Error("getReservedContractRequests error", "error", err.Error())
+		return false, err
+	}
+
+	if !verifyReservedContractRequests(reservedRequests, req) {
+		uv.xlog.Error("verifyReservedContractRequests error", "reservedRequests", reservedRequests, "req", req)
+		return false, fmt.Errorf("verify reservedContracts error")
+	}
+
 	if req == nil {
 		if tx.GetTxInputsExt() != nil || tx.GetTxOutputsExt() != nil {
 			uv.xlog.Error("verifyTxRWSets error", "error", ErrInvalidTxExt.Error())
@@ -1304,29 +1365,60 @@ func (uv *UtxoVM) verifyTxRWSets(tx *pb.Transaction) (bool, error) {
 		}
 		return true, nil
 	}
-	moduleName := req.GetModuleName()
-	vm, err := uv.vmMgr3.GetVM(moduleName)
-	if err != nil {
-		return false, err
-	}
+
 	env, err := uv.model3.PrepareEnv(tx)
 	if err != nil {
 		return false, err
+	}
+	contextConfig := &contract.ContextConfig{
+		XMCache:      env.GetModelCache(),
+		Initiator:    tx.GetInitiator(),
+		AuthRequire:  tx.GetAuthRequire(),
+		ContractName: "",
+		GasLimit:     int64(0),
 	}
 	gasLimit, err := getGasLimitFromTx(tx)
 	if err != nil {
 		return false, err
 	}
+	gasRemain := int64(contract.MaxGasLimit)
 	uv.xlog.Trace("get gas limit from tx", "gasLimit", gasLimit, "txid", hex.EncodeToString(tx.Txid))
-	ctx, err := vm.NewContext(req.GetContractName(), env.GetModelCache(), gasLimit)
-	if err != nil {
-		return false, err
+
+	for i := 0; i < len(tx.GetContractRequests()); i++ {
+		if i == len(reservedRequests) {
+			gasRemain = gasLimit
+		}
+		tmpReq := tx.GetContractRequests()[i]
+		moduleName := tmpReq.GetModuleName()
+		vm, err := uv.vmMgr3.GetVM(moduleName)
+		if err != nil {
+			return false, err
+		}
+
+		contextConfig.GasLimit = gasRemain
+		contextConfig.ContractName = tmpReq.GetContractName()
+		ctx, err := vm.NewContext(contextConfig)
+		if err != nil {
+			// FIXME zq @icexin: need to return contract not found
+			uv.xlog.Error("verifyTxRWSets NewContext error", "err", err, "contractName", tmpReq.GetContractName())
+			if i < len(reservedRequests) && err.Error() == "leveldb: not found" {
+				continue
+			}
+			return false, err
+		}
+
+		_, err = ctx.Invoke(tmpReq.MethodName, tmpReq.Args)
+		if err != nil {
+			ctx.Release()
+			uv.xlog.Error("verifyTxRWSets Invoke error", "error", err, "contractName", tmpReq.GetContractName())
+			return false, err
+		}
+		if i >= len(reservedRequests) {
+			gasRemain -= ctx.GasUsed()
+		}
+		ctx.Release()
 	}
-	_, err = ctx.Invoke(req.MethodName, req.Args)
-	defer ctx.Release()
-	if err != nil {
-		return false, err
-	}
+
 	_, writeSet, err := env.GetModelCache().GetRWSets()
 	if err != nil {
 		return false, err
@@ -1348,6 +1440,7 @@ func (uv *UtxoVM) IsInUnConfirm(txid string) bool {
 
 // DoTx 执行一个交易, 影响utxo表和unconfirm-transaction表
 func (uv *UtxoVM) DoTx(tx *pb.Transaction) error {
+	tx.ReceivedTimestamp = time.Now().UnixNano()
 	if tx.Coinbase {
 		uv.xlog.Warn("coinbase tx can not be given by PostTx", "txid", global.F(tx.Txid))
 		return ErrUnexpected
@@ -1414,7 +1507,7 @@ func (uv *UtxoVM) processUnconfirmTxs(block *pb.InternalBlock, batch kvdb.Batch,
 	}
 	uv.mutex.Lock()
 	// 下面开始处理unconfirmed的交易
-	unconfirmTxMap, unconfirmTxGraph, loadErr := uv.sortUnconfirmedTx()
+	unconfirmTxMap, unconfirmTxGraph, delayedTxMap, loadErr := uv.sortUnconfirmedTx()
 	if loadErr != nil {
 		return nil, nil, loadErr
 	}
@@ -1473,7 +1566,11 @@ func (uv *UtxoVM) processUnconfirmTxs(block *pb.InternalBlock, batch kvdb.Batch,
 				break
 			}
 		}
-		if hasConflict {
+		tooDelayed := delayedTxMap[string(unconfirmTx.Txid)]
+		if tooDelayed {
+			uv.xlog.Warn("will undo tx because it is beyond confirmed delay", "txid", global.F(unconfirmTx.Txid))
+		}
+		if hasConflict || tooDelayed {
 			undoErr := uv.undoUnconfirmedTx(unconfirmTx, unconfirmTxMap, unconfirmTxGraph, batch, undoDone)
 			if undoErr != nil {
 				uv.xlog.Warn("fail to undo tx", "undoErr", undoErr)
@@ -1639,7 +1736,7 @@ func (uv *UtxoVM) PlayForMiner(blockid []byte, batch kvdb.Batch) error {
 // RollBackUnconfirmedTx 回滚本地未确认交易
 func (uv *UtxoVM) RollBackUnconfirmedTx() (map[string]bool, error) {
 	batch := uv.ldb.NewBatch()
-	unconfirmTxMap, unconfirmTxGraph, loadErr := uv.sortUnconfirmedTx()
+	unconfirmTxMap, unconfirmTxGraph, _, loadErr := uv.sortUnconfirmedTx()
 	if loadErr != nil {
 		return nil, loadErr
 	}
@@ -1994,4 +2091,10 @@ func (uv *UtxoVM) GetXModel() *xmodel.XModel {
 // GetACLManager return ACLManager instance
 func (uv *UtxoVM) GetACLManager() *acli.Manager {
 	return uv.aclMgr
+}
+
+// SetMaxConfirmedDelay set the max value of tx confirm delay. If beyond, tx will be rollbacked
+func (uv *UtxoVM) SetMaxConfirmedDelay(seconds uint32) {
+	uv.maxConfirmedDelay = seconds
+	uv.xlog.Info("set max confirmed delay of tx", "seconds", seconds)
 }

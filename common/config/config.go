@@ -13,15 +13,19 @@ const (
 	// NodeModeNormal NODE_MODE_NORMAL node mode for normal
 	NodeModeNormal = "Normal"
 	// NodeModeFastSync NODE_MODE_FAST_SYNC node mode for fast
-	NodeModeFastSync       = "FastSync"
-	DefaultNetPort         = 47101             // p2p port
-	DefaultNetKeyPath      = "./data/netkeys/" // node private key path
-	DefaultNetIsNat        = true              // use NAT
-	DefaultNetIsSecure     = true              // use encrypted secure transport
-	DefaultNetIsHidden     = false
-	DefaultMaxStreamLimits = 1024
-	DefaultMaxMessageSize  = 128
-	DefaultTimeout         = 3
+	NodeModeFastSync        = "FastSync"
+	DefaultNetPort          = 47101             // p2p port
+	DefaultNetKeyPath       = "./data/netkeys/" // node private key path
+	DefaultNetIsNat         = true              // use NAT
+	DefaultNetIsSecure      = true              // use encrypted secure transport
+	DefaultNetIsHidden      = false
+	DefaultMaxStreamLimits  = 1024
+	DefaultMaxMessageSize   = 128
+	DefaultTimeout          = 3
+	DefaultIsAuthentication = false
+	DefautltAuthTimeout     = 30
+	// limitation size for same ip
+	DefaultStreamIPLimitSize = 10
 )
 
 // LogConfig is the log config of node
@@ -76,6 +80,10 @@ type P2PConfig struct {
 	MaxMessageSize int64 `yaml:"maxMessageSize,omitempty"`
 	// timeout config the timeout of Request with response
 	Timeout int64 `yaml:"timeout,omitempty"`
+	// IsAuthentication determine whether peerID and Xchain addr correspond
+	IsAuthentication bool `yaml:"isauthentication,omitempty"`
+	// StreamIPLimitSize set the limitation size for same ip
+	StreamIPLimitSize int64 `yaml:"streamIPLimitSize,omitempty"`
 }
 
 // MinerConfig is the config of miner
@@ -93,7 +101,8 @@ type UtxoConfig struct {
 	ContractExecutionTime int                        `yaml:"contractExecutionTime,omitempty"`
 	ContractWhiteList     map[string]map[string]bool `yaml:"contractWhiteList,omitempty"`
 	// 是否开启新版本tx k = bcname, v = isBetaTx
-	IsBetaTx map[string]bool `yaml:"isBetaTx,omitempty"`
+	IsBetaTx          map[string]bool `yaml:"isBetaTx,omitempty"`
+	MaxConfirmedDelay uint32          `yaml:"maxConfirmedDelay,omitempty"`
 }
 
 // FeeConfig is the config of Fee
@@ -184,7 +193,7 @@ type NodeConfig struct {
 	Wasm            WasmConfig `yaml:"wasm,omitempty"`
 }
 
-// KernelConfig kerner config
+// KernelConfig kernel config
 type KernelConfig struct {
 	MinNewChainAmount string          `yaml:"minNewChainAmount,omitempty"`
 	NewChainWhiteList map[string]bool `yaml:"newChainWhiteList,omitempty"`
@@ -237,6 +246,7 @@ func (nc *NodeConfig) defaultNodeConfig() {
 		ContractExecutionTime: 500,
 		ContractWhiteList:     make(map[string]map[string]bool),
 		IsBetaTx:              make(map[string]bool),
+		MaxConfirmedDelay:     300,
 	}
 	nc.DedupCacheSize = 50000
 	nc.Kernel = KernelConfig{
@@ -271,14 +281,17 @@ func NewNodeConfig() *NodeConfig {
 // newP2pConfigWithDefault create default p2p configuration
 func newP2pConfigWithDefault() P2PConfig {
 	return P2PConfig{
-		Port:            DefaultNetPort,
-		KeyPath:         DefaultNetKeyPath,
-		IsNat:           DefaultNetIsNat,
-		IsSecure:        DefaultNetIsNat,
-		IsHidden:        DefaultNetIsHidden,
-		MaxStreamLimits: DefaultMaxStreamLimits,
-		MaxMessageSize:  DefaultMaxMessageSize,
-		Timeout:         DefaultTimeout,
+		Port:             DefaultNetPort,
+		KeyPath:          DefaultNetKeyPath,
+		IsNat:            DefaultNetIsNat,
+		IsSecure:         DefaultNetIsSecure,
+		IsHidden:         DefaultNetIsHidden,
+		MaxStreamLimits:  DefaultMaxStreamLimits,
+		MaxMessageSize:   DefaultMaxMessageSize,
+		Timeout:          DefaultTimeout,
+		IsAuthentication: DefaultIsAuthentication,
+		// default stream ip limit size
+		StreamIPLimitSize: DefaultStreamIPLimitSize,
 	}
 }
 

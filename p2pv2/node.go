@@ -49,6 +49,9 @@ type Node struct {
 	ctx     context.Context
 	srv     *P2PServerV2
 	quitCh  chan bool
+	addrs   map[string]*XchainAddrInfo
+	// StreamLimit
+	streamLimit *StreamLimit
 }
 
 // NewNode define the node of the xuper, it will set streamHandler for this node.
@@ -71,7 +74,12 @@ func NewNode(cfg config.P2PConfig, log log.Logger) (*Node, error) {
 		ctx:    ctx,
 		host:   ho,
 		quitCh: make(chan bool, 1),
+		addrs:  map[string]*XchainAddrInfo{},
+		// new StreamLimit
+		streamLimit: &StreamLimit{},
 	}
+	// initialize StreamLimit, set limit size
+	no.streamLimit.Init(cfg.StreamIPLimitSize, log)
 	ho.SetStreamHandler(XuperProtocolID, no.handlerNewStream)
 
 	if no.kdht, err = dht.New(ctx, ho); err != nil {
